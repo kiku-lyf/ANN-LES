@@ -58,10 +58,6 @@ mpi_F = np.zeros((Lx, LYv, Q))
 mpi_u0 = np.zeros((Lx, LYv, 2))
 
 # Buffers for communication
-# Layout: [F (Q), U (2), Rho (1)] * Lx
-# We need to exchange 2 rows: 
-# Send Top Row (local index Ly) -> Neighbor Above
-# Send Bottom Row (local index 1) -> Neighbor Below
 buffer_size = (Q + 2 + 1) * Lx
 send_top = np.zeros(buffer_size)
 send_btm = np.zeros(buffer_size)
@@ -96,11 +92,9 @@ def init_local(mpi_f, mpi_u, mpi_rho, Lx, Ly):
 
 @njit
 def pack_buffers(send_top, send_btm, mpi_f, mpi_u, mpi_rho, Lx, Ly):
-    # Top Row is at index Ly
-    # Bottom Row is at index 1
     idx = 0
     for i in range(Lx):
-        # Top Row Data
+        # Top Row Data (Ly)
         for k in range(Q):
             send_top[idx] = mpi_f[i][Ly][k]
             idx += 1
@@ -112,7 +106,7 @@ def pack_buffers(send_top, send_btm, mpi_f, mpi_u, mpi_rho, Lx, Ly):
     
     idx = 0
     for i in range(Lx):
-        # Bottom Row Data
+        # Bottom Row Data (1)
         for k in range(Q):
             send_btm[idx] = mpi_f[i][1][k]
             idx += 1
@@ -123,72 +117,74 @@ def pack_buffers(send_top, send_btm, mpi_f, mpi_u, mpi_rho, Lx, Ly):
         idx += 1
 
 @njit
-def unpack_buffers(recv_top, recv_btm, mpi_f, mpi_u, mpi_rho, Lx, Ly):
+def unpack_buffers(recv_top, recv_btm, mpi_f, mpi_u, mpi_rho, Lx, Ly, has_top, has_btm):
     # Receive from Top Neighbor -> Goes to Top Ghost (Ly + 1)
-    # Receive from Bottom Neighbor -> Goes to Bottom Ghost (0)
-    
-    idx = 0
-    for i in range(Lx):
-        for k in range(Q):
-            mpi_f[i][Ly + 1][k] = recv_top[idx]
+    if has_top:
+        idx = 0
+        for i in range(Lx):
+            for k in range(Q):
+                mpi_f[i][Ly + 1][k] = recv_top[idx]
+                idx += 1
+            for m in range(2):
+                mpi_u[i][Ly + 1][m] = recv_top[idx]
+                idx += 1
+            mpi_rho[i][Ly + 1] = recv_top[idx]
             idx += 1
-        for m in range(2):
-            mpi_u[i][Ly + 1][m] = recv_top[idx]
-            idx += 1
-        mpi_rho[i][Ly + 1] = recv_top[idx]
-        idx += 1
         
-    idx = 0
-    for i in range(Lx):
-        for k in range(Q):
-            mpi_f[i][0][k] = recv_btm[idx]
+    # Receive from Bottom Neighbor -> Goes to Bottom Ghost (0)
+    if has_btm:
+        idx = 0
+        for i in range(Lx):
+            for k in range(Q):
+                mpi_f[i][0][k] = recv_btm[idx]
+                idx += 1
+            for m in range(2):
+                mpi_u[i][0][m] = recv_btm[idx]
+                idx += 1
+            mpi_rho[i][0] = recv_btm[idx]
             idx += 1
-        for m in range(2):
-            mpi_u[i][0][m] = recv_btm[idx]
-            idx += 1
-        mpi_rho[i][0] = recv_btm[idx]
-        idx += 1
 
 def mpi_communicate():
-    # Pack
     pack_buffers(send_top, send_btm, mpi_f, mpi_u, mpi_rho, Lx, Ly)
     
-    # Neighbors
     top_nbr = rank + 1 if rank < size - 1 else MPI.PROC_NULL
     btm_nbr = rank - 1 if rank > 0 else MPI.PROC_NULL
     
-    # Send Top to Top_Nbr (He receives in his Btm Buffer? No, he receives my Top as his Btm Ghost)
-    # Wait, if I am Rank 0, I send my Top (Ly) to Rank 1.
-    # Rank 1 receives it into his Bottom Ghost (0).
-    # So Rank 1's recv_btm should be filled by Rank 0's send_top.
-    
     reqs = []
     
-    # Send Top to Top Neighbor
     if top_nbr != MPI.PROC_NULL:
         reqs.append(comm.Isend(send_top, dest=top_nbr, tag=10))
         reqs.append(comm.Irecv(recv_top, source=top_nbr, tag=20))
         
-    # Send Bottom to Bottom Neighbor
     if btm_nbr != MPI.PROC_NULL:
-        reqs.append(comm.Isend(send_btm, dest=btm_nbr, tag=20)) # Tag 20 matches Top Nbr's recv logic
-        reqs.append(comm.Irecv(recv_btm, source=btm_nbr, tag=10)) # Tag 10 matches Btm Nbr's send logic
+        reqs.append(comm.Isend(send_btm, dest=btm_nbr, tag=20)) 
+        reqs.append(comm.Irecv(recv_btm, source=btm_nbr, tag=10)) 
         
     MPI.Request.Waitall(reqs)
     
-    # Unpack
-    unpack_buffers(recv_top, recv_btm, mpi_f, mpi_u, mpi_rho, Lx, Ly)
+    has_top = top_nbr != MPI.PROC_NULL
+    has_btm = btm_nbr != MPI.PROC_NULL
+    unpack_buffers(recv_top, recv_btm, mpi_f, mpi_u, mpi_rho, Lx, Ly, has_top, has_btm)
 
 @njit
 def mpi_evolution(mpi_f, mpi_u, mpi_rho, mpi_F, mpi_u0, rank, size, Lx, Ly, U):
-    LYv = Ly + 2
+    # Determine simulation range
+    # Global Y=0 is at Rank 0, local j=1
+    # Global Y=NY is at Rank size-1, local j=Ly
+    # These are walls, do not evolve in bulk loop
+    
+    j_start = 1
+    j_end = Ly + 1 # range is exclusive, so this covers 1..Ly
+    
+    if rank == 0:
+        j_start = 2 # Skip j=1 (Bottom Wall)
+        
+    if rank == size - 1:
+        j_end = Ly # Skip j=Ly (Top Wall) -> range ends at Ly
     
     # Internal Evolution (Collision + Streaming)
-    # Range: 1..Lx-2 (Global X inner), 1..Ly (Local Y)
-    # Using ghosts at 0 and Ly+1
-    
     for i in range(1, Lx - 1):
-        for j in range(1, Ly + 1):
+        for j in range(j_start, j_end):
             for k in range(Q):
                 ip = i - e[k][0]
                 jp = j - e[k][1]
@@ -196,7 +192,7 @@ def mpi_evolution(mpi_f, mpi_u, mpi_rho, mpi_F, mpi_u0, rank, size, Lx, Ly, U):
 
     # Macro Variables Update
     for i in range(1, Lx - 1):
-        for j in range(1, Ly + 1):
+        for j in range(j_start, j_end):
             mpi_u0[i][j][0] = mpi_u[i][j][0]
             mpi_u0[i][j][1] = mpi_u[i][j][1]
             
@@ -208,12 +204,33 @@ def mpi_evolution(mpi_f, mpi_u, mpi_rho, mpi_F, mpi_u0, rank, size, Lx, Ly, U):
                 mpi_rho[i][j] += mpi_f[i][j][k]
                 mpi_u[i][j][0] += e[k][0] * mpi_f[i][j][k]
                 mpi_u[i][j][1] += e[k][1] * mpi_f[i][j][k]
-            mpi_u[i][j][0] /= mpi_rho[i][j]
-            mpi_u[i][j][1] /= mpi_rho[i][j]
+            
+            # Safe division check
+            if mpi_rho[i][j] > 1e-10:
+                mpi_u[i][j][0] /= mpi_rho[i][j]
+                mpi_u[i][j][1] /= mpi_rho[i][j]
+            else:
+                # This should not happen if boundaries are correct
+                mpi_u[i][j][0] = 0.0
+                mpi_u[i][j][1] = 0.0
 
     # Boundaries
     # Left/Right (X=0 and X=NX=Lx-1)
-    for j in range(1, Ly + 1):
+    # Apply to ALL rows (1..Ly) because walls also need L/R BC?
+    # Original code: for j in range(1, NY): (skips walls)
+    # So we should probably match the bulk loop range for L/R BCs too?
+    # Or just 1..Ly for simplicity, as corner nodes are tricky.
+    # Original code: for j in range(1, NY): -> applies to 1..NY-1.
+    # Rank 0: j=1 is Global 0 (Wall). j=2.. is Fluid.
+    # Rank size-1: j=Ly is Global NY (Wall).
+    # So L/R BCs should skip the wall rows too.
+    
+    j_bc_start = 1
+    j_bc_end = Ly + 1
+    if rank == 0: j_bc_start = 2
+    if rank == size - 1: j_bc_end = Ly
+
+    for j in range(j_bc_start, j_bc_end):
         # Right (X=Lx-1)
         mpi_rho[Lx-1][j] = mpi_rho[Lx-2][j]
         for k in range(Q):
@@ -246,13 +263,8 @@ def error_local(mpi_u, mpi_u0, Lx, Ly, rank, size):
     temp1 = 0.0
     temp2 = 0.0
     
-    # Determine valid range for error calc
-    # Skip Global Y=0 and Global Y=NY? LBM.py loops 1..NY-1.
-    # Start J: 1 if rank==0 else 1
-    # End J: Ly-1 if rank==size-1 else Ly
-    
     j_start = 2 if rank == 0 else 1
-    j_end = Ly - 1 if rank == size - 1 else Ly + 1 # range is exclusive at end
+    j_end = Ly if rank == size - 1 else Ly + 1
     
     for i in range(1, Lx - 1):
         for j in range(j_start, j_end):
@@ -262,7 +274,6 @@ def error_local(mpi_u, mpi_u0, Lx, Ly, rank, size):
 
 @njit
 def tforce(T, u, Ub):
-    # Original tforce from LBM.py (Runs on gathered global u)
     for i in range(1, 127):
         for j in range(1, 127):
             ujj = 0.0
@@ -306,7 +317,6 @@ def tforce(T, u, Ub):
 
 @njit
 def ronudU(Ub, A, Am):
-    # Original ronudU from LBM.py
     for i in range(1, 127):
         for j in range(1, 127):
             if i < 126 and j < 126:
@@ -403,50 +413,43 @@ def main():
             if rank == 0:
                 err = np.sqrt(tot_e1) / (np.sqrt(tot_e2) + 1e-30)
                 print(f"n={n}, error={err:.6e}")
+                sys.stdout.flush()
                 
-                # Check for convergence or output
-                if n % 20000 == 0 or (n >= 10000 and err < 1.0e-6) or n % 5000 == 0:
-                    # Need to gather full U
-                    # Receive from all ranks
-                    # Local part: mpi_u[:, 1:Ly+1, :]
-                    pass
-
-            # Gather logic (Blocking)
-            # Send local valid u (Lx, Ly, 2) to rank 0
-            local_valid_u = mpi_u[:, 1:Ly+1, :].copy() # Extract internal rows
-            # Gather at rank 0
-            # Result will be list of arrays on rank 0
-            gathered_list = comm.gather(local_valid_u, root=0)
+            # Broadcast error/stop condition
+            # We need to broadcast the error to all ranks if we want them to stop together?
+            # Or just broadcast a 'stop' flag.
             
-            if rank == 0:
-                # Concatenate along Y axis (axis 1)
-                # Note: gather returns list ordered by rank
-                # Rank 0 is Bottom, Rank size-1 is Top.
-                # Correct order for concatenation.
-                u_gathered = np.concatenate(gathered_list, axis=1)
-                
-                # Check point
-                print(f"Center U: {u_gathered[NX//2][NY//2]}")
-
-                if n % 20000 == 0:
-                    output(n, u_gathered)
-                
-                if n % 5000 == 0:
-                    tforce(T, u_gathered, Ub)
-                    ronudU(Ub, A, Am)
-                    writefileE1(Ub, A, T)
-                
-                if n == 500000 or (n >= 10000 and err < 1.0e-6):
-                    break
-            
-            # Broadcast break condition? 
-            # If rank 0 decides to break, must notify others.
             stop = False
+            do_output = False
+            do_excel = False
+            
             if rank == 0:
+                if n % 20000 == 0:
+                    do_output = True
+                if n % 5000 == 0:
+                    do_excel = True
                 if n == 500000 or (n >= 10000 and err < 1.0e-6):
                     stop = True
-            
+
+            # Broadcast decisions
             stop = comm.bcast(stop, root=0)
+            do_output = comm.bcast(do_output, root=0)
+            do_excel = comm.bcast(do_excel, root=0)
+
+            if do_output or do_excel or stop:
+                # Gather logic
+                local_valid_u = mpi_u[:, 1:Ly+1, :].copy() 
+                gathered_list = comm.gather(local_valid_u, root=0)
+                
+                if rank == 0:
+                    u_gathered = np.concatenate(gathered_list, axis=1)
+                    if do_output:
+                        output(n, u_gathered)
+                    if do_excel:
+                        tforce(T, u_gathered, Ub)
+                        ronudU(Ub, A, Am)
+                        writefileE1(Ub, A, T)
+            
             if stop:
                 break
 
