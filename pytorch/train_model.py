@@ -44,7 +44,7 @@ class StressDataset(Dataset):
         return self.x[idx], self.y[idx]
 
 # 导入数据
-df = pd.read_excel('end1w.xlsx', 0)
+df = pd.read_excel('data.xlsx', 0)
 df = df.iloc[:, :]
 x = df.iloc[:, 2:-4].values
 # 可以根据需要选择不同的输出列
